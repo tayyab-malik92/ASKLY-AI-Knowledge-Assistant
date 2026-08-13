@@ -1,215 +1,562 @@
 import json
+import logging
 import re
+from typing import Any, Optional, Tuple
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
 from app.db.models import Message, Session as DBSession
-from app.schemas.chat import ChatRequest, ChatResponse, SourceReference, NoteResponse
+from app.schemas.chat import (
+    ChatRequest,
+    ChatResponse,
+    SourceReference,
+    NoteResponse,
+)
 from app.core.llm_client import llm_client
 from app.tools.note_tools import (
-    TOOL_DEFINITIONS, 
-    save_note_handler, 
+    TOOL_DEFINITIONS,
+    save_note_handler,
     list_notes_handler,
     delete_note_handler,
-    summarize_session_handler
+    summarize_session_handler,
 )
 from app.rag.retriever import retriever
 from app.rag.rewriter import analyze_and_rewrite_query
 
+
+logger = logging.getLogger("askly.chat")
+
 router = APIRouter(tags=["Chat & Notes"])
 
 
-@router.post("/chat", response_model=ChatResponse)
-async def chat_endpoint(request: ChatRequest, db: Session = Depends(get_db)):
+# ================================================================
+# CONSTANTS & PATTERNS
+# ================================================================
+
+FALLBACK_ANSWER = (
+    "I couldn't generate an answer right now. Please try the question again."
+)
+
+TOOL_ACTION_PATTERNS = [
+    r"\bsave\s+(?:a\s+)?note\b",
+    r"\brecord\s+(?:a\s+)?note\b",
+    r"\bcreate\s+(?:a\s+)?note\b",
+    r"\bremember\s+(?:this|that)\b",
+
+    r"\blist\s+(?:my\s+)?notes?\b",
+    r"\bshow\s+(?:my\s+)?notes?\b",
+
+    r"\bdelete\s+(?:the\s+)?note\b",
+    r"\bremove\s+(?:the\s+)?note\b",
+
+    r"\bsummarize\b",
+    r"\bsummary\b",
+    r"\bwhat did we talk about\b",
+    r"\bchat history\b",
+
+    r"\bcompare\s+.+\s+(?:and|vs\.?|versus)\s+.+\b",
+]
+
+
+# ================================================================
+# GENERIC OBJECT HELPERS
+# ================================================================
+
+def _get(
+    obj: Any,
+    name: str,
+    default: Any = None,
+) -> Any:
+    if obj is None:
+        return default
+
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+
+    return getattr(obj, name, default)
+
+
+def _extract_content(response: Any) -> str:
+    if response is None:
+        return ""
+
+    content = _get(response, "content")
+
+    if isinstance(content, str):
+        return content.strip()
+
+    if isinstance(content, list):
+        parts = []
+
+        for item in content:
+            if isinstance(item, dict):
+                text = item.get("text")
+            else:
+                text = getattr(item, "text", None)
+
+            if isinstance(text, str):
+                parts.append(text)
+
+        return "\n".join(parts).strip()
+
+    if content is not None:
+        return str(content).strip()
+
+    return ""
+
+
+def _extract_tool_calls(response: Any) -> list:
+    return list(
+        _get(response, "tool_calls") or []
+    )
+
+
+def _safe_json_args(raw: Any) -> dict:
+    if isinstance(raw, dict):
+        return raw
+
+    if not isinstance(raw, str) or not raw.strip():
+        return {}
+
     try:
-        # 1. Manage session record in SQLite
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+
+    if isinstance(parsed, list):
+        parsed = parsed[0] if parsed else {}
+
+    return (
+        parsed
+        if isinstance(parsed, dict)
+        else {}
+    )
+
+
+def _is_tool_action(message: str) -> bool:
+    return any(
+        re.search(
+            pattern,
+            message,
+            re.IGNORECASE,
+        )
+        for pattern in TOOL_ACTION_PATTERNS
+    )
+
+
+def _is_unknown_answer(text: str) -> bool:
+    normalized = " ".join(
+        (text or "").lower().split()
+    )
+
+    phrases = [
+        "i don't know based on the uploaded pdf",
+        "i don't know based on the pdf",
+        "i couldn't find reliable information",
+        "i could not find reliable information",
+        "i couldn't find information about this topic in the uploaded document",
+        "i could not find information about this topic in the uploaded document",
+        "the uploaded pdf does not contain",
+        "the pdf does not contain",
+        "not enough information in the provided context",
+        "not enough information in the pdf",
+    ]
+
+    return any(
+        phrase in normalized
+        for phrase in phrases
+    )
+
+
+# ================================================================
+# HYBRID RAG / GENERAL CHAT GENERATION
+# ================================================================
+
+def _generate_hybrid_answer(
+    user_message: str,
+    retrieved_context: str,
+) -> Tuple[str, bool]:
+    if retrieved_context.strip():
+        system_prompt = (
+            "You are Askly, a helpful assistant. "
+            "First, try to answer the user's question using ONLY the provided PDF evidence. "
+            "If the PDF evidence contains the answer, provide it clearly. "
+            "If the PDF evidence does NOT contain the answer, reply with exact text: 'NOT_FOUND_IN_PDF'"
+        ).strip()
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"PDF EVIDENCE:\n{retrieved_context}\n\nUSER QUESTION:\n{user_message}"}
+        ]
+
+        try:
+            response = llm_client.call(messages=messages, temperature=0.0)
+            answer = _extract_content(response)
+            
+            if answer and "NOT_FOUND_IN_PDF" not in answer and not _is_unknown_answer(answer):
+                return answer.strip(), False
+        except Exception:
+            logger.exception("PDF-based generation failed, falling back to general chat.")
+
+    general_system_prompt = (
+        "You are Askly, a knowledgeable AI chatbot. "
+        "The user's question could not be answered using the uploaded PDF document. "
+        "Please provide a helpful, accurate, and comprehensive answer using your general knowledge."
+    ).strip()
+
+    general_messages = [
+        {"role": "system", "content": general_system_prompt},
+        {"role": "user", "content": user_message}
+    ]
+
+    try:
+        response = llm_client.call(messages=general_messages, temperature=0.3)
+        general_answer = _extract_content(response)
+        
+        if general_answer:
+            return general_answer.strip() + "\n\n*(Note: This information is out of the uploaded PDF)*", True
+    except Exception:
+        logger.exception("General knowledge generation failed.")
+
+    return "I couldn't generate an answer for this right now.", True
+
+
+# ================================================================
+# SESSION SUMMARY
+# ================================================================
+
+def _run_summary(
+    db: Session,
+    session_id: str,
+) -> str:
+    try:
+        result = summarize_session_handler(db, session_id)
+    except Exception:
+        return "I couldn't read the conversation history right now."
+
+    if not isinstance(result, dict):
+        return "I couldn't generate the session summary right now."
+
+    history = result.get("raw_history", "")
+
+    if not history:
+        return "There is no conversation history recorded for this session yet."
+
+    messages = [
+        {
+            "role": "system",
+            "content": "Summarize ONLY the supplied conversation log. Return a concise bullet-point summary.",
+        },
+        {
+            "role": "user",
+            "content": f"Conversation log:\n{history}",
+        },
+    ]
+
+    try:
+        response = llm_client.call(messages=messages, temperature=0.0)
+        return _extract_content(response) or "I couldn't generate the session summary right now."
+    except Exception:
+        return "I couldn't generate the session summary right now."
+
+
+# ================================================================
+# TOOL EXECUTION & KEYWORD FALLBACKS
+# ================================================================
+
+def _execute_tool_call(
+    db: Session,
+    session_id: str,
+    user_message: str,
+    function_name: str,
+    args: dict,
+) -> Tuple[str, Optional[int]]:
+
+    if function_name == "save_note":
+        title = str(args.get("title") or "Untitled").strip() or "Untitled"
+        content = str(args.get("content") or "").strip() or user_message.strip()
+        tags = str(args.get("tags") or "").strip()
+
+        result = save_note_handler(db, session_id, title, content, tags)
+        if result.get("status") != "success":
+            return result.get("message", "Could not save the note."), None
+
+        note_id = result.get("saved_note_id")
+        return f"Note saved successfully with ID #{note_id}.\n\n**Title:** {title}\n**Content:** {content}", note_id
+
+    if function_name == "list_notes":
+        notes = list_notes_handler(db, session_id)
+        if not notes:
+            return "You have no saved notes in this session.", None
+
+        notes_text = "\n".join(f"- **#{note['id']} {note['title']}**: {note['content']}" for note in notes)
+        return f"Here are your saved notes:\n{notes_text}", None
+
+    if function_name == "delete_note":
+        try:
+            note_id = int(args.get("note_id"))
+        except (TypeError, ValueError):
+            return "Please provide a valid note ID, for example: **Delete note #3**.", None
+
+        result = delete_note_handler(db, session_id, note_id)
+        return result.get("message", f"Note #{note_id} processed."), None
+
+    if function_name == "summarize_session":
+        return _run_summary(db, session_id), None
+
+    if function_name == "compare_concepts":
+        concept_a = str(args.get("concept_a") or "").strip()
+        concept_b = str(args.get("concept_b") or "").strip()
+
+        if not concept_a or not concept_b:
+            return "Please provide both concepts to compare.", None
+
+        try:
+            docs_a = retriever.search(query=concept_a, top_k=3) or []
+            docs_b = retriever.search(query=concept_b, top_k=3) or []
+        except Exception:
+            docs_a, docs_b = [], []
+
+        context_a = "\n".join(d.get("content", "") for d in docs_a if d.get("content"))
+        context_b = "\n".join(d.get("content", "") for d in docs_b if d.get("content"))
+
+        comparison_prompt = [
+            {
+                "role": "system",
+                "content": "Compare two concepts using the supplied PDF contexts or general knowledge if PDF context is missing.",
+            },
+            {
+                "role": "user",
+                "content": f"Concept A: {concept_a}\nContext A:\n{context_a}\n\nConcept B: {concept_b}\nContext B:\n{context_b}",
+            },
+        ]
+
+        try:
+            response = llm_client.call(messages=comparison_prompt, temperature=0.0)
+            return _extract_content(response) or "I couldn't compare those concepts right now.", None
+        except Exception:
+            return "I couldn't compare those concepts right now.", None
+
+    return "I couldn't process that action.", None
+
+
+def _keyword_fallback_action(
+    db: Session,
+    session_id: str,
+    request_message: str,
+) -> Tuple[str, Optional[int]]:
+    msg = request_message.lower()
+
+    if re.search(r"\b(summarize|summary)\b", msg) or "what did we talk about" in msg or "chat history" in msg:
+        return _run_summary(db, session_id), None
+
+    if re.search(r"\b(delete|remove)\b", msg) and "note" in msg:
+        match = re.search(r"(?:#|note\s*)?(\d+)\b", msg)
+        if not match:
+            return "Please provide the note ID, for example: **Delete note #3**.", None
+        note_id = int(match.group(1))
+        result = delete_note_handler(db, session_id, note_id)
+        return result.get("message", "Note processed."), None
+
+    if re.search(r"\b(list|show)\b", msg) and re.search(r"\bnotes?\b", msg):
+        notes = list_notes_handler(db, session_id)
+        if not notes:
+            return "You have no saved notes in this session.", None
+        notes_text = "\n".join(f"- **#{note['id']} {note['title']}**: {note['content']}" for note in notes)
+        return f"Here are your saved notes:\n{notes_text}", None
+
+    if re.search(r"\b(save|record|create|remember)\b", msg) and ("note" in msg or "this" in msg or "that" in msg):
+        title_match = re.search(r"(?:titled|title(?:d)?\s+as)\s+['\"]([^'\"]+)['\"]", request_message, re.IGNORECASE)
+        title = title_match.group(1) if title_match else "Untitled Note"
+        content = request_message
+
+        result = save_note_handler(db, session_id, title, content)
+        if result.get("status") != "success":
+            return result.get("message", "Could not save note."), None
+        note_id = result.get("saved_note_id")
+        return f"Note saved successfully with ID #{note_id}.\n\n**Title:** {title}\n**Content:** {content}", note_id
+
+    return "", None
+
+
+# ================================================================
+# CHAT ENDPOINT
+# ================================================================
+
+@router.post(
+    "/chat",
+    response_model=ChatResponse,
+)
+async def chat_endpoint(
+    request: ChatRequest,
+    db: Session = Depends(get_db),
+):
+    try:
+        user_message = (request.message or "").strip()
+
+        if not user_message:
+            raise HTTPException(status_code=400, detail="Message cannot be empty.")
+
         session_obj = db.query(DBSession).filter(DBSession.id == request.session_id).first()
         if not session_obj:
             session_obj = DBSession(id=request.session_id)
             db.add(session_obj)
             db.commit()
 
-        # 2. Extract recent past history for query rewriting
-        past = db.query(Message).filter(Message.session_id == request.session_id).order_by(Message.timestamp.desc()).limit(6).all()
-        history_text = "\n".join([f"{m.role}: {m.content}" for m in reversed(past)])
+        past_messages = (
+            db.query(Message)
+            .filter(Message.session_id == request.session_id)
+            .order_by(Message.timestamp.desc())
+            .limit(12)
+            .all()
+        )
+        past_messages.reverse()
 
-        # Save user message to database
-        db.add(Message(session_id=request.session_id, role="user", content=request.message))
+        history_text = "\n".join(f"{message.role}: {message.content}" for message in past_messages)
+
+        db.add(Message(session_id=request.session_id, role="user", content=user_message))
         db.commit()
 
-        # 3. Rewrite query (analyzes follow-ups using past history and outputs validated JSON)
-        rewritten = analyze_and_rewrite_query(request.message, history_text)
-        intent = rewritten.get("intent", "RAG_SEARCH")
-        rewritten_query = rewritten.get("rewritten_query", request.message)
+        # Safer query rewriter handling with explicit fallback
+        try:
+            rewritten = analyze_and_rewrite_query(user_message, history_text)
+            if not isinstance(rewritten, dict):
+                rewritten = {}
+        except Exception:
+            logger.exception("Query rewriting module encountered an error; proceeding with original message.")
+            rewritten = {}
 
-        # Force intent override if message matches explicit tool operations
-        msg_lower = request.message.lower()
-        tool_keywords = ["save note", "save a note", "record note", "create note", "list notes", "show notes", "delete note", "summarize session", "summarize what"]
-        if any(kw in msg_lower for kw in tool_keywords):
+        intent = str(rewritten.get("intent") or "RAG_SEARCH").upper()
+        rewritten_query = str(rewritten.get("rewritten_query") or user_message).strip() or user_message
+
+        if _is_tool_action(user_message):
             intent = "TOOL_ACTION"
 
-        retrieved_context = None
-        sources = []
-        saved_note_id = None
+        if intent == "TOOL_ACTION":
+            tool_messages = [
+                {
+                    "role": "system",
+                    "content": "You are Askly's action router. Use a tool only when the user explicitly asks to save, list, delete, summarize, or compare.",
+                },
+                {"role": "user", "content": user_message},
+            ]
 
-        # Path 1: Vector Document Search via ChromaDB
-        if intent == "RAG_SEARCH":
-            docs = retriever.search(query=rewritten_query, top_k=2)
-            if docs:
-                retrieved_context = "\n\n".join([f"Source ({d['source']}): {d['content']}" for d in docs])
-                sources = [SourceReference(document=d["source"], snippet=d["content"][:100]) for d in docs]
+            response_msg = None
+            try:
+                response_msg = llm_client.call_with_tools(messages=tool_messages, tools=TOOL_DEFINITIONS, temperature=0.0)
+            except Exception:
+                pass
 
-        # Construct System Prompt with strict Grounding Rules
-        sys_prompt = (
-            "You are Askly, an intelligent research assistant.\n\n"
-            "STRICT GROUNDING RULES:\n"
-            "1. Answer the user query strictly using the retrieved context provided below.\n"
-            "2. If the user's question asks about topics completely absent from the retrieved context (e.g., general science definitions like 'what is BIOLOGY' or external facts not in the context), explicitly state: "
-            "'I couldn't find information about this topic in the uploaded document.'\n"
-            "3. Do NOT make up answers using outside knowledge if context is provided but doesn't contain the answer.\n"
-            "4. If the user commands an explicit action like saving, listing, or deleting notes, or summarizing, execute the respective tool call.\n"
-            "5. DO NOT output XML or function tags like <function> in text output."
-        )
+            final_answer = ""
+            saved_note_id = None
 
-        if retrieved_context:
-            sys_prompt += f"\n\nRetrieved Context:\n{retrieved_context}"
+            for tool_call in _extract_tool_calls(response_msg):
+                function_obj = _get(tool_call, "function")
+                function_name = str(_get(function_obj, "name", "") or "")
+                args = _safe_json_args(_get(function_obj, "arguments"))
 
-        messages_payload = [
-            {"role": "system", "content": sys_prompt},
-            {"role": "user", "content": request.message}
+                try:
+                    answer_text, note_id = _execute_tool_call(db, request.session_id, user_message, function_name, args)
+                except Exception:
+                    answer_text, note_id = "I couldn't complete that action due to an internal error.", None
+
+                if answer_text:
+                    final_answer = answer_text
+                if note_id is not None:
+                    saved_note_id = note_id
+
+            if not final_answer:
+                final_answer, fallback_note_id = _keyword_fallback_action(db, request.session_id, user_message)
+                if saved_note_id is None:
+                    saved_note_id = fallback_note_id
+
+            if not final_answer.strip():
+                final_answer = FALLBACK_ANSWER
+
+            db.add(Message(session_id=request.session_id, role="assistant", content=final_answer))
+            db.commit()
+
+            return ChatResponse(
+                answer=final_answer,
+                sources=[],
+                retrieved_context=None,
+                saved_note_id=saved_note_id,
+            )
+
+        try:
+            docs = retriever.search(query=rewritten_query, top_k=4) or []
+        except Exception:
+            docs = []
+
+        useful_docs = [
+            doc for doc in docs
+            if isinstance(doc, dict) and str(doc.get("content", "")).strip()
         ]
 
-        # Call LLM with tool definitions, handling potential Groq tool-use errors gracefully
-        try:
-            response_msg = llm_client.call_with_tools(messages=messages_payload, tools=TOOL_DEFINITIONS)
-        except Exception:
-            # Fallback to direct chat mode if Groq tool syntax validation fails
-            response_msg = llm_client.call_with_tools(messages=messages_payload, tools=[])
+        context_parts = []
+        for index, doc in enumerate(useful_docs, start=1):
+            source = doc.get("source", "uploaded document")
+            content = str(doc.get("content", "")).strip()
+            context_parts.append(f"[PDF SOURCE {index}: {source}]\n{content}")
 
-        final_answer = ""
+        retrieved_context = "\n\n".join(context_parts)
 
-        # Path A: Standard Function/Tool Calling Logic
-        if response_msg.tool_calls:
-            for tool_call in response_msg.tool_calls:
-                func_name = tool_call.function.name
-                
-                try:
-                    raw_args = json.loads(tool_call.function.arguments or "{}")
-                    args = raw_args[0] if isinstance(raw_args, list) and len(raw_args) > 0 else raw_args
-                    if not isinstance(args, dict):
-                        args = {}
-                except Exception:
-                    args = {}
+        sources = [
+            SourceReference(
+                document=doc.get("source", "uploaded document"),
+                snippet=str(doc.get("content", ""))[:300],
+            )
+            for doc in useful_docs
+        ]
 
-                # Tool 1: Save Note
-                if func_name == "save_note":
-                    title = args.get("title", "Untitled")
-                    content = args.get("content", "")
-                    tags = args.get("tags", "")
-                    
-                    res = save_note_handler(db, request.session_id, title, content, tags)
-                    saved_note_id = res.get("saved_note_id")
-                    final_answer = f"Note saved successfully with ID #{saved_note_id}."
+        final_answer, is_out_of_pdf = _generate_hybrid_answer(
+            user_message=user_message,
+            retrieved_context=retrieved_context,
+        )
 
-                # Tool 2: List Notes
-                elif func_name == "list_notes":
-                    notes = list_notes_handler(db, request.session_id)
-                    final_answer = f"Saved notes: {json.dumps(notes)}"
+        if is_out_of_pdf:
+            sources = []
+            retrieved_context = None
 
-                # Tool 3: Delete Note
-                elif func_name == "delete_note":
-                    note_id = args.get("note_id", 0)
-                    res = delete_note_handler(db, request.session_id, int(note_id))
-                    final_answer = res.get("message")
-
-                # Tool 4: Compare Concepts
-                elif func_name == "compare_concepts":
-                    concept_a = args.get("concept_a", "")
-                    concept_b = args.get("concept_b", "")
-                    
-                    docs_a = retriever.search(query=concept_a, top_k=2) if concept_a else []
-                    docs_b = retriever.search(query=concept_b, top_k=2) if concept_b else []
-                    
-                    context_a_str = "\n".join([d['content'] for d in docs_a]) if docs_a else "No relevant context found."
-                    context_b_str = "\n".join([d['content'] for d in docs_b]) if docs_b else "No relevant context found."
-                    
-                    final_answer = (
-                        f"### Comparison: {concept_a} vs {concept_b}\n\n"
-                        f"**{concept_a}:**\n{context_a_str}\n\n"
-                        f"**{concept_b}:**\n{context_b_str}"
-                    )
-
-                # Tool 5: Summarize Session
-                elif func_name == "summarize_session":
-                    summary_res = summarize_session_handler(db, request.session_id)
-                    history_data = summary_res.get("raw_history", "")
-                    
-                    if not history_data or summary_res.get("status") == "empty":
-                        final_answer = "There is no previous conversation history recorded for this session yet."
-                    else:
-                        summary_prompt = [
-                            {"role": "system", "content": "You are a research assistant. Summarize the following session history clearly into concise bullet points detailing key topics discussed and actions taken."},
-                            {"role": "user", "content": f"Conversation Log:\n{history_data}"}
-                        ]
-                        summary_response = llm_client.call_with_tools(messages=summary_prompt, tools=[])
-                        final_answer = summary_response.content or "Could not generate session summary."
-
-                # Tool 6: Get Source Metadata
-                elif func_name == "get_source_metadata":
-                    final_answer = "Knowledge base index includes active files under `./data/` directory (e.g., sample.pdf)."
-
-        # Path B: Deterministic Fallback Guard (If LLM skips tool_calls and returns plain text)
-        else:
-            if intent == "TOOL_ACTION" and "save" in msg_lower:
-                title_match = re.search(r"titled\s+['\"]?([^'\"]+)['\"]?", request.message, re.IGNORECASE)
-                content_match = re.search(r"content\s+['\"]?([^'\"]+)['\"]?", request.message, re.IGNORECASE)
-                
-                extracted_title = title_match.group(1).rstrip('.') if title_match else "Saved Note"
-                extracted_content = content_match.group(1).rstrip('.') if content_match else request.message
-                
-                res = save_note_handler(db, request.session_id, extracted_title, extracted_content, "")
-                saved_note_id = res.get("saved_note_id")
-                final_answer = f"Note saved successfully with ID #{saved_note_id}."
-            else:
-                content = response_msg.content or ""
-                if "<function" in content:
-                    content = content.split("<function")[0].strip()
-                final_answer = content or "No response generated."
-
-                # Post-check: If LLM explicitly indicates out-of-context topic, clear sources list
-                if "couldn't find information" in final_answer.lower() or "not in the uploaded document" in final_answer.lower():
-                    sources = []
-
-        # Save assistant answer to database
         db.add(Message(session_id=request.session_id, role="assistant", content=final_answer))
         db.commit()
 
         return ChatResponse(
             answer=final_answer,
             sources=sources,
-            retrieved_context=retrieved_context if sources else None,
-            saved_note_id=saved_note_id
+            retrieved_context=retrieved_context,
+            saved_note_id=None,
         )
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Unhandled error in /chat")
+        raise HTTPException(status_code=500, detail="An internal error occurred while processing the chat.") from exc
 
 
-@router.get("/notes", response_model=list[NoteResponse])
-async def get_notes_endpoint(session_id: str, db: Session = Depends(get_db)):
-    """Secondary Endpoint: Fetch all notes directly without LLM calling."""
+@router.get(
+    "/notes",
+    response_model=list[NoteResponse],
+)
+async def get_notes_endpoint(
+    session_id: str,
+    db: Session = Depends(get_db),
+):
     try:
         notes = list_notes_handler(db, session_id)
         return [
             NoteResponse(
-                id=n["id"],
+                id=note["id"],
                 session_id=session_id,
-                title=n["title"],
-                content=n["content"],
-                tags=n.get("tags") or ""
+                title=note["title"],
+                content=note["content"],
+                tags=note.get("tags") or "",
             )
-            for n in notes
+            for note in notes
         ]
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as exc:
+        logger.exception("Failed to fetch notes.")
+        raise HTTPException(status_code=500, detail="Could not fetch notes.") from exc

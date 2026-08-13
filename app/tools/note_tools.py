@@ -1,131 +1,299 @@
+import logging
+
 from sqlalchemy.orm import Session
+
 from app.db.models import SavedNote, Message
 
-# ---------------------------------------------------------
-# Python Tool Handlers
-# ---------------------------------------------------------
 
-def save_note_handler(db: Session, session_id: str, title: str, content: str, tags: str = "") -> dict:
-    note = SavedNote(session_id=session_id, title=title, content=content, tags=tags)
-    db.add(note)
-    db.commit()
-    db.refresh(note)
-    return {"status": "success", "saved_note_id": note.id}
-
-def list_notes_handler(db: Session, session_id: str) -> list:
-    notes = db.query(SavedNote).filter(SavedNote.session_id == session_id).all()
-    return [{"id": n.id, "title": n.title, "content": n.content, "tags": n.tags} for n in notes]
-
-def delete_note_handler(db: Session, session_id: str, note_id: int) -> dict:
-    note = db.query(SavedNote).filter(SavedNote.id == note_id, SavedNote.session_id == session_id).first()
-    if not note:
-        return {"status": "error", "message": f"Note #{note_id} not found."}
-    db.delete(note)
-    db.commit()
-    return {"status": "success", "message": f"Note #{note_id} deleted successfully."}
-
-def summarize_session_handler(db: Session, session_id: str) -> dict:
-    messages = db.query(Message).filter(Message.session_id == session_id).order_by(Message.timestamp.asc()).all()
-    if not messages:
-        return {"status": "empty", "summary": "No previous conversation history found."}
-    
-    chat_log = "\n".join([f"{m.role.upper()}: {m.content}" for m in messages])
-    return {"status": "success", "total_messages": len(messages), "raw_history": chat_log}
+logger = logging.getLogger("askly.note_tools")
 
 
-# ---------------------------------------------------------
-# JSON Schemas for Function Calling
-# ---------------------------------------------------------
+def save_note_handler(
+    db: Session,
+    session_id: str,
+    title: str,
+    content: str,
+    tags: str = "",
+) -> dict:
+    title = (title or "Untitled").strip() or "Untitled"
+    content = (content or "").strip()
+    tags = (tags or "").strip()
+
+    if not content:
+        return {
+            "status": "error",
+            "message": "Cannot save an empty note.",
+            "saved_note_id": None,
+        }
+
+    try:
+        note = SavedNote(
+            session_id=session_id,
+            title=title,
+            content=content,
+            tags=tags,
+        )
+
+        db.add(note)
+        db.commit()
+        db.refresh(note)
+
+        return {
+            "status": "success",
+            "saved_note_id": note.id,
+        }
+
+    except Exception:
+        db.rollback()
+        logger.exception(
+            "Failed to save note for session %s",
+            session_id,
+        )
+
+        return {
+            "status": "error",
+            "message": "Could not save the note due to a database error.",
+            "saved_note_id": None,
+        }
+
+
+def list_notes_handler(
+    db: Session,
+    session_id: str,
+) -> list:
+    try:
+        notes = (
+            db.query(SavedNote)
+            .filter(SavedNote.session_id == session_id)
+            .order_by(SavedNote.id.asc())
+            .all()
+        )
+
+        return [
+            {
+                "id": note.id,
+                "title": note.title,
+                "content": note.content,
+                "tags": note.tags or "",
+            }
+            for note in notes
+        ]
+
+    except Exception:
+        logger.exception(
+            "Failed to list notes for session %s",
+            session_id,
+        )
+        return []
+
+
+def delete_note_handler(
+    db: Session,
+    session_id: str,
+    note_id: int,
+) -> dict:
+    try:
+        note = (
+            db.query(SavedNote)
+            .filter(
+                SavedNote.id == note_id,
+                SavedNote.session_id == session_id,
+            )
+            .first()
+        )
+
+        if not note:
+            return {
+                "status": "error",
+                "message": f"Note #{note_id} not found.",
+            }
+
+        db.delete(note)
+        db.commit()
+
+        return {
+            "status": "success",
+            "message": f"Note #{note_id} deleted successfully.",
+        }
+
+    except Exception:
+        db.rollback()
+
+        logger.exception(
+            "Failed to delete note #%s for session %s",
+            note_id,
+            session_id,
+        )
+
+        return {
+            "status": "error",
+            "message": (
+                f"Could not delete note #{note_id} "
+                "due to a database error."
+            ),
+        }
+
+
+def summarize_session_handler(
+    db: Session,
+    session_id: str,
+) -> dict:
+    try:
+        messages = (
+            db.query(Message)
+            .filter(Message.session_id == session_id)
+            .order_by(Message.timestamp.asc())
+            .all()
+        )
+
+        if not messages:
+            return {
+                "status": "empty",
+                "raw_history": "",
+            }
+
+        # Exclude the very last incoming user message if it is requesting the summary itself
+        if len(messages) > 1:
+            last_content = (messages[-1].content or "").lower()
+            if (
+                "summarize" in last_content
+                or "summary" in last_content
+                or "what did we talk about" in last_content
+            ):
+                messages = messages[:-1]
+
+        if not messages:
+            return {
+                "status": "empty",
+                "raw_history": "",
+            }
+
+        chat_log = "\n".join(
+            f"{message.role.upper()}: {message.content}"
+            for message in messages
+        )
+
+        return {
+            "status": "success",
+            "raw_history": chat_log,
+        }
+
+    except Exception:
+        logger.exception(
+            "Failed to build session history for %s",
+            session_id,
+        )
+
+        return {
+            "status": "error",
+            "raw_history": "",
+        }
+
 
 TOOL_DEFINITIONS = [
     {
         "type": "function",
         "function": {
             "name": "save_note",
-            "description": "CRITICAL: MUST be called whenever the user asks to save, record, or store a note, summary, or snippet into SQLite.",
+            "description": (
+                "Saves a note to SQLite. Use only when the user explicitly "
+                "asks to save, record, create, or remember a note."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "title": {"type": "string", "description": "Title of the note"},
-                    "content": {"type": "string", "description": "Body text or content to save"},
-                    "tags": {"type": "string", "description": "Optional comma-separated tags"}
+                    "title": {
+                        "type": "string",
+                        "description": "Short title for the note.",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "The note content.",
+                    },
+                    "tags": {
+                        "type": "string",
+                        "description": "Optional comma-separated tags.",
+                    },
                 },
                 "required": ["title", "content"],
-                "additionalProperties": False
+                "additionalProperties": False,
             },
-            "strict": True
-        }
+            "strict": True,
+        },
     },
     {
         "type": "function",
         "function": {
             "name": "list_notes",
-            "description": "Lists all user-saved notes for the active session. ONLY use when user explicitly requests to list or show saved notes.",
+            "description": (
+                "Lists all notes belonging to the current session. "
+                "Use only when the user explicitly asks to list/show notes."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {},
-                "additionalProperties": False
+                "additionalProperties": False,
             },
-            "strict": True
-        }
+            "strict": True,
+        },
     },
     {
         "type": "function",
         "function": {
             "name": "delete_note",
-            "description": "Deletes a specific note from SQLite using its note ID. ONLY use when user asks to delete a note.",
+            "description": (
+                "Deletes one note by ID. Use only when the user explicitly "
+                "asks to delete/remove a note."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "note_id": {"type": "integer", "description": "The ID of the note to delete"}
+                    "note_id": {
+                        "type": "integer",
+                        "description": "ID of the note to delete.",
+                    },
                 },
                 "required": ["note_id"],
-                "additionalProperties": False
+                "additionalProperties": False,
             },
-            "strict": True
-        }
+            "strict": True,
+        },
     },
     {
         "type": "function",
         "function": {
             "name": "compare_concepts",
-            "description": "ONLY use when the user EXPLICITLY asks to compare two distinct concepts side-by-side using the word 'compare'. Do NOT use for general queries like 'what are its types'.",
+            "description": (
+                "Compares two concepts using information retrieved from "
+                "the uploaded PDF."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "concept_a": {"type": "string", "description": "First concept to compare"},
-                    "concept_b": {"type": "string", "description": "Second concept to compare"}
+                    "concept_a": {"type": "string"},
+                    "concept_b": {"type": "string"},
                 },
                 "required": ["concept_a", "concept_b"],
-                "additionalProperties": False
+                "additionalProperties": False,
             },
-            "strict": True
-        }
+            "strict": True,
+        },
     },
     {
         "type": "function",
         "function": {
             "name": "summarize_session",
-            "description": "CRITICAL: MUST be called whenever the user asks to summarize, recap, or review the discussion or conversation history of the current session.",
+            "description": (
+                "Summarizes the current conversation session. Use only "
+                "when the user explicitly asks to summarize the chat, "
+                "conversation, or session."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {},
-                "additionalProperties": False
+                "additionalProperties": False,
             },
-            "strict": True
-        }
+            "strict": True,
+        },
     },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_source_metadata",
-            "description": "Inspects ChromaDB vector index to return names of all indexed files.",
-            "parameters": {
-                "type": "object",
-                "properties": {},
-                "additionalProperties": False
-            },
-            "strict": True
-        }
-    }
 ]
