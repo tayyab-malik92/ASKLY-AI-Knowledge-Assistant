@@ -8,6 +8,5 @@ class Settings:
     DATABASE_URL: str = os.getenv("DATABASE_URL", "sqlite:///./askly.db")
     CHROMA_DB_DIR: str = os.getenv("CHROMA_DB_DIR", "./chroma_db")
     DATA_DIR: str = os.getenv("DATA_DIR", "./data")
-    LLM_MODEL: str = "llama-3.3-70b-versatile"
-
+    LLM_MODEL: str = os.getenv("LLM_MODEL", "llama-3.1-70b-versatile")
 settings = Settings()
