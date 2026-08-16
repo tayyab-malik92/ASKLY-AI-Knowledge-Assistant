@@ -32,6 +32,13 @@ ASKLY features smart query rewriting, semantic chunking, and dual-mode intellige
 * **Architect & Lead Engineer:** Muhammad Tayyab Malik
 
 ---
+<div align="center">
+
+![ASKLY UI Preview](screenshots/askly_landing.png)
+
+</div>
+
+---
 
 ## ✨ 2. Key Features
 
@@ -75,8 +82,6 @@ ASKLY/
 ├── askly.db              # Persistent SQLite Database
 ├── requirements.txt      # Python Dependencies
 └── .env                  # Environment Configuration
-
----
 
 ⚙️ 5. Installation and Setup
 Prerequisites
